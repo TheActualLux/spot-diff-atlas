@@ -1,41 +1,136 @@
-// A working best-game-01 entry (Node 22, standard library only): the game is this directory's
-// game/ folder, plain static files a desktop browser loads offline (game/index.html and its ES
-// modules, no library and no network request), and the program hands it in. It copies game/ and
-// screenshots/ from beside this file to /output and writes /output/dossier.json, the summary the
-// judge reads, with the vendored make.fun library. A starting point, not a winner: Block Dodger, a
-// plain 2D canvas game where a paddle dodges falling blocks and catches coins, with a title screen,
-// score, lives and levels, game over and restart, flat colours and no sound. Build your own game
-// (any genre, any library you vendor under game/, or none), put your 3 or 4 PNG or JPEG screenshots
-// in screenshots/ (the first by name is the cover) and run it.
-//
-// Serve it locally with `node serve.ts`, then open http://localhost:8080.
-// Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
-//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
-
-import { cpSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+// Between Tides entry packager. Validate the supplied cover states first, then assemble the
+// browser game and its screenshots into the make.fun dossier directory.
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildDossier } from './vendor/makefun-game.ts';
 
-const here = fileURLToPath(new URL('.', import.meta.url));
-const out = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const repository = dirname(fileURLToPath(import.meta.url));
+const destination = resolve(process.env.MAKEFUN_OUTPUT_DIR ?? '/output');
+const shotFiles = ['1-start.jpg', '2-play.jpg', '3-end.jpg'];
+const maximumShotBytes = 256 * 1024;
+const expectedWidth = 1280;
+const expectedHeight = 800;
 
-mkdirSync(out, { recursive: true });
-cpSync(join(here, 'game'), join(out, 'game'), { recursive: true });
-mkdirSync(join(out, 'screenshots'), { recursive: true });
-if (existsSync(join(here, 'screenshots'))) cpSync(join(here, 'screenshots'), join(out, 'screenshots'), { recursive: true });
+function report(message) {
+  console.log(`[Between Tides] ${message}`);
+}
 
-// The scorer's own caps (reference/gate.json): only text_max_bytes shapes the bytes; the others refuse an entry the
-// scorer would refuse (more than 4 screenshots or one over 256 KiB; more than 993 files in game/ or 48 MiB of game
-// files, in all, or a path under game/ over 1000 bytes: game/ counts beside /output's own 1000-entry cap, its
-// screenshots/ and dossier.json).
-writeFileSync(
-  join(out, 'dossier.json'),
-  buildDossier(out, {
+function fail(message) {
+  throw new Error(`[Between Tides] ${message}`);
+}
+
+function isStartOfFrame(marker) {
+  return [
+    0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7,
+    0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf,
+  ].includes(marker);
+}
+
+function readJpegSize(bytes, filename) {
+  if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) {
+    fail(`${filename} is not a JPEG file (missing SOI marker).`);
+  }
+
+  let offset = 2;
+  while (offset < bytes.length) {
+    if (bytes[offset] !== 0xff) {
+      fail(`${filename} has an invalid JPEG marker at byte ${offset}.`);
+    }
+    while (offset < bytes.length && bytes[offset] === 0xff) offset++;
+    if (offset >= bytes.length) break;
+
+    const marker = bytes[offset++];
+    if (marker === 0xd9 || marker === 0xda) break;
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+    if (offset + 2 > bytes.length) break;
+
+    const segmentLength = bytes.readUInt16BE(offset);
+    if (segmentLength < 2 || offset + segmentLength > bytes.length) {
+      fail(`${filename} contains a truncated JPEG segment.`);
+    }
+    if (isStartOfFrame(marker)) {
+      if (segmentLength < 7) fail(`${filename} has a malformed JPEG frame header.`);
+      return {
+        height: bytes.readUInt16BE(offset + 3),
+        width: bytes.readUInt16BE(offset + 5),
+      };
+    }
+    offset += segmentLength;
+  }
+
+  fail(`${filename} has no readable JPEG frame header.`);
+}
+
+function validateScreenshotSet() {
+  const folder = join(repository, 'screenshots');
+  if (!existsSync(folder) || !statSync(folder).isDirectory()) {
+    fail('The screenshots/ directory is missing.');
+  }
+
+  report(`Checking ${shotFiles.length} required screenshot files.`);
+  for (const filename of shotFiles) {
+    const fullPath = join(folder, filename);
+    if (!existsSync(fullPath) || !statSync(fullPath).isFile()) {
+      fail(`Required screenshot is missing: screenshots/${filename}`);
+    }
+
+    const bytes = readFileSync(fullPath);
+    if (bytes.length >= maximumShotBytes) {
+      fail(`screenshots/${filename} is ${bytes.length} bytes; each JPEG must be under ${maximumShotBytes} bytes.`);
+    }
+
+    const { width, height } = readJpegSize(bytes, `screenshots/${filename}`);
+    if (width !== expectedWidth || height !== expectedHeight) {
+      fail(`screenshots/${filename} is ${width}x${height}; expected ${expectedWidth}x${expectedHeight}.`);
+    }
+    report(`  ✓ ${filename} — ${width}x${height}, ${bytes.length} bytes`);
+  }
+}
+
+function copyGameFiles() {
+  const source = join(repository, 'game');
+  if (!existsSync(source) || !statSync(source).isDirectory()) {
+    fail('The game/ directory is missing; nothing can be packaged.');
+  }
+  report('Copying game/ into the entry directory.');
+  cpSync(source, join(destination, 'game'), { recursive: true });
+}
+
+function copyScreenshotFiles() {
+  const source = join(repository, 'screenshots');
+  report('Copying validated screenshots/ into the entry directory.');
+  cpSync(source, join(destination, 'screenshots'), { recursive: true });
+}
+
+function writeEntryDossier() {
+  const dossierPath = join(destination, 'dossier.json');
+  const dossier = buildDossier(destination, {
     text_max_bytes: 163840,
-    screenshots: { max: 4, max_bytes: 262144 },
+    screenshots: { max: 4, max_bytes: maximumShotBytes },
     game_max_files: 993,
     game_max_bytes: 50331648,
     game_path_max_bytes: 1000,
-  }),
-);
+  });
+  writeFileSync(dossierPath, dossier);
+  report(`Wrote dossier.json to ${dossierPath}.`);
+}
+
+function packageEntry() {
+  report(`Preparing output at ${destination}.`);
+  validateScreenshotSet();
+  mkdirSync(destination, { recursive: true });
+  copyGameFiles();
+  copyScreenshotFiles();
+  writeEntryDossier();
+  report('Entry packaging finished successfully.');
+}
+
+packageEntry();
